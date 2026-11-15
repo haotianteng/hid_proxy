@@ -61,6 +61,31 @@ km.move(10,20)
 km.click(1)
 ```
 
+## Keyboard injection (`km.press`, `km.type`, `km.release`, `km.keys`)
+
+The bridge can drive the **keyboard** of the target PC through the KMBox (Board 1), next to the mouse. Keycodes are USB
+HID usage IDs (decimal or `0x` hex, e.g. `4` = `a`, `0x28` = Enter); modifiers are the HID modifier bitmask
+(`0x01` LCtrl, `0x02` LShift, `0x04` LAlt, `0x08` LGUI/Win, `0x10`-`0x80` the right-hand versions).
+
+| Command | Effect |
+|---|---|
+| `km.press(keycode[,modifiers])` | tap one key (press + release), e.g. `km.press(4,2)` types `A` |
+| `km.type("text")` | type US-layout ASCII, one tap per character (12 ms apart) |
+| `km.release()` | release every key (use it if a key ever gets stuck) |
+| `km.keys(mods[,k1..k5])` | set the **complete** keyboard state in one report: modifier bitmask plus up to 5 held keys. The caller owns every key-down and key-up time, so human-like timing, rollover and long holds are possible. `km.keys(0)` releases everything |
+| `km.human(0\|1\|2)` | KMBox humanization of mouse moves: 0 = off (raw), 1 = micro, 2 = full (the default after every boot of Board 1) |
+| `km.version()` | `kmbox bridge v1.2 keys human failsafe` |
+
+Notes
+- Arguments are parsed strictly (decimal digits or `0x` hex, 0..255, no empty arguments, the `)` must end the line);
+  malformed `km.press` / `km.keys` / `km.human` lines are answered with `ERR: ...` instead of being forwarded.
+- Keyboard and mouse share **one** USB HID endpoint on Board 1. A report that arrives while it is busy is dropped,
+  so verify delivery on the target (e.g. `GetAsyncKeyState`) and re-send; leave >= 2 ms between consecutive packets.
+- Failsafe: when the host closes the serial port (or the controlling program is killed) the bridge sends an empty
+  keyboard state (three times) and releases all mouse buttons, so a hard kill can no longer leave a key stuck down.
+- Example (Python, pyserial): `ser.write(b"km.keys(2,4)\r\n"); time.sleep(0.09); ser.write(b"km.keys(0)\r\n")`
+  holds LShift+`a` for 90 ms.
+
 ## Performance & Troubleshooting
 
 **Performance:**

@@ -354,6 +354,15 @@ static inline bool send_uart_packet(const uint8_t* data, size_t len) {
     return hw_uart_send(data, len);
 }
 
+// Like send_uart_packet() but first waits (<= ~30 us for 8 bytes at 3 Mbaud) for the previous
+// DMA transfer to finish. hw_uart_send() silently drops a packet while the TX DMA is busy, so
+// commands that arrive back-to-back in one CDC read (e.g. a release-everything burst) must use
+// this variant or the later ones are lost.
+static inline bool send_uart_packet_wait(const uint8_t* data, size_t len) {
+    hw_uart_tx_wait();
+    return hw_uart_send(data, len);
+}
+
 // ============================================================================
 // UART RX Processing - Status Messages from KMBox
 // ============================================================================
@@ -918,6 +927,183 @@ static makcu_state_t makcu_state = MAKCU_STATE_IDLE;
 // Ferrum line buffer (moved from file scope for better organization)
 // Note: ferrum_line and ferrum_idx already defined at file scope above
 
+// ----------------------------------------------------------------------------
+// Keyboard injection: km.press(keycode[,modifiers]) and km.type(text)
+// Forwarded to the KMBox as FAST_CMD_KEY_PRESS (0x0C), which taps the key
+// (press + release). Keycodes are USB HID usage IDs; modifiers are the HID
+// modifier bitmask (0x01 LCtrl, 0x02 LShift, 0x04 LAlt, 0x08 LGUI).
+// ----------------------------------------------------------------------------
+#define KEY_TAP_DELAY_MS 12  // spacing between taps so the host sees every report
+#define HID_MOD_LSHIFT   0x02
+
+// A key packet with no modifiers and no keycode produces an all-keys-up report.
+static void send_key_release_all(void) {
+    uint8_t pkt[FAST_CMD_PACKET_SIZE] = {0};
+    pkt[0] = FAST_CMD_KEY_PRESS;
+    send_uart_packet_wait(pkt, sizeof(pkt));
+    sleep_ms(KEY_TAP_DELAY_MS);
+}
+
+// The KMBox emits press and release back-to-back, and the release can be dropped
+// (host sees a stuck, auto-repeating key). Send the release again after a delay.
+static void send_key_tap(uint8_t modifiers, uint8_t keycode) {
+    uint8_t pkt[FAST_CMD_PACKET_SIZE] = {0};
+    pkt[0] = FAST_CMD_KEY_PRESS;
+    pkt[1] = modifiers;
+    pkt[2] = keycode;
+    send_uart_packet_wait(pkt, sizeof(pkt));
+    sleep_ms(KEY_TAP_DELAY_MS);
+    send_key_release_all();
+}
+
+// Map a US-layout ASCII character to a HID keycode (+ shift). Returns 0 if unmapped.
+static uint8_t ascii_to_hid(char c, uint8_t* modifiers) {
+    static const char shifted_digits[] = ")!@#$%^&*(";  // shift + 0..9
+    *modifiers = 0;
+    if (c >= 'a' && c <= 'z') return 0x04 + (c - 'a');
+    if (c >= 'A' && c <= 'Z') { *modifiers = HID_MOD_LSHIFT; return 0x04 + (c - 'A'); }
+    if (c >= '1' && c <= '9') return 0x1E + (c - '1');
+    if (c == '0') return 0x27;
+    for (int i = 0; i < 10; i++) {
+        if (c == shifted_digits[i]) {
+            *modifiers = HID_MOD_LSHIFT;
+            return i == 0 ? 0x27 : 0x1E + (i - 1);
+        }
+    }
+    switch (c) {
+        case '\n': return 0x28;
+        case '\t': return 0x2B;
+        case ' ':  return 0x2C;
+        case '-':  return 0x2D;
+        case '=':  return 0x2E;
+        case '[':  return 0x2F;
+        case ']':  return 0x30;
+        case '\\': return 0x31;
+        case ';':  return 0x33;
+        case '\'': return 0x34;
+        case '`':  return 0x35;
+        case ',':  return 0x36;
+        case '.':  return 0x37;
+        case '/':  return 0x38;
+        case '_':  *modifiers = HID_MOD_LSHIFT; return 0x2D;
+        case '+':  *modifiers = HID_MOD_LSHIFT; return 0x2E;
+        case '{':  *modifiers = HID_MOD_LSHIFT; return 0x2F;
+        case '}':  *modifiers = HID_MOD_LSHIFT; return 0x30;
+        case '|':  *modifiers = HID_MOD_LSHIFT; return 0x31;
+        case ':':  *modifiers = HID_MOD_LSHIFT; return 0x33;
+        case '"':  *modifiers = HID_MOD_LSHIFT; return 0x34;
+        case '~':  *modifiers = HID_MOD_LSHIFT; return 0x35;
+        case '<':  *modifiers = HID_MOD_LSHIFT; return 0x36;
+        case '>':  *modifiers = HID_MOD_LSHIFT; return 0x37;
+        case '?':  *modifiers = HID_MOD_LSHIFT; return 0x38;
+        default:   return 0;
+    }
+}
+
+static void reply_err(const char* msg) {
+    if (tud_cdc_connected()) {
+        tud_cdc_write_str(msg);
+        tud_cdc_write_flush();
+    }
+}
+
+static bool is_dec_digit(char c) { return c >= '0' && c <= '9'; }
+static bool is_hex_digit(char c) { return is_dec_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+
+// Strictly parse "v1[,v2...])" where every value is plain decimal digits or 0x-prefixed hex in
+// 0..255 (no signs, no empty arguments, no octal), the ')' is the last character (trailing
+// blanks allowed) and there are at most max_vals values. Returns the value count, or -1.
+static int parse_byte_args(const char* p, long* vals, int max_vals) {
+    int n = 0;
+    for (;;) {
+        int base = 10;
+        const char* digits = p;
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; digits = p + 2; }
+        if (!(base == 16 ? is_hex_digit(digits[0]) : is_dec_digit(digits[0]))) return -1;
+        char* end;
+        long v = strtol(digits, &end, base);
+        if (end == digits || v < 0 || v > 0xFF || n >= max_vals) return -1;
+        vals[n++] = v;
+        p = end;
+        if (*p == ',') { p++; continue; }
+        break;
+    }
+    if (*p != ')') return -1;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    return *p == '\0' ? n : -1;
+}
+
+// km.press(keycode[,modifiers]) - numbers may be decimal or 0x-prefixed hex
+static bool handle_key_press_command(const char* cmd) {
+    if (strncmp(cmd, "km.press(", 9) != 0) return false;
+    long v[2] = {0};
+    int n = parse_byte_args(cmd + 9, v, 2);
+    if (n < 1 || v[0] == 0) { reply_err("ERR: km.press(keycode[,modifiers])\r\n"); return true; }
+    send_key_tap((uint8_t)(n > 1 ? v[1] : 0), (uint8_t)v[0]);
+    return true;
+}
+
+// km.type("text") or km.type(text) - types US-layout ASCII, one tap per character
+static bool handle_type_command(const char* cmd) {
+    if (strncmp(cmd, "km.type(", 8) != 0) return false;
+    const char* start = cmd + 8;
+    size_t len = strlen(start);
+    if (len == 0 || start[len - 1] != ')') return false;
+    len--;  // drop the closing paren
+    if (len >= 2 && start[0] == '"' && start[len - 1] == '"') { start++; len -= 2; }
+    for (size_t i = 0; i < len; i++) {
+        uint8_t mods;
+        uint8_t code = ascii_to_hid(start[i], &mods);
+        if (code) send_key_tap(mods, code);
+    }
+    send_key_release_all();
+    return true;
+}
+
+// km.release() - clear every held key (use if a key ever gets stuck)
+static bool handle_key_release_command(const char* cmd) {
+    if (strncmp(cmd, "km.release()", 12) != 0) return false;
+    send_key_release_all();
+    return true;
+}
+
+// km.keys(mods[,k1[,k2[,k3[,k4[,k5]]]]]) - set the COMPLETE keyboard state in one packet:
+// the HID modifier bitmask plus up to 5 held keycodes (decimal or 0x-prefixed hex).
+// The KMBox applies it as the new state and its immediate follow-up all-keys-up
+// report is dropped while the USB endpoint is busy, so the host owns the hold
+// time: send the state when a key goes down and the reduced state when it goes
+// up. km.keys(0) releases everything. Allow >= 2 ms between consecutive packets.
+static bool handle_keys_command(const char* cmd) {
+    if (strncmp(cmd, "km.keys(", 8) != 0) return false;
+    long vals[6] = {0};
+    int n = parse_byte_args(cmd + 8, vals, 6);
+    if (n < 1) { reply_err("ERR: km.keys(mods[,k1..k5])\r\n"); return true; }
+    uint8_t pkt[FAST_CMD_PACKET_SIZE] = {0};
+    pkt[0] = FAST_CMD_KEY_COMBO;
+    pkt[1] = (uint8_t)vals[0];                      // modifiers
+    int slot = 2;                                   // keycode, keys[0..3]; zero = no key, so compact
+    for (int i = 1; i < n && slot < 7; i++) {
+        if (vals[i] != 0) pkt[slot++] = (uint8_t)vals[i];
+    }
+    send_uart_packet_wait(pkt, sizeof(pkt));
+    return true;
+}
+
+// km.human(mode) - KMBox firmware humanization: 0 = off (raw pass-through),
+// 1 = micro (sub-pixel noise only, for already-humanized input), 2 = full (default
+// after boot; subdivides and jitters every move). Resets to full on KMBox reboot.
+static bool handle_human_command(const char* cmd) {
+    if (strncmp(cmd, "km.human(", 9) != 0) return false;
+    long mode = 0;
+    int n = parse_byte_args(cmd + 9, &mode, 1);
+    if (n != 1 || mode > 2) { reply_err("ERR: km.human(0|1|2)\r\n"); return true; }
+    uint8_t pkt[FAST_CMD_PACKET_SIZE];
+    fast_build_set_human(pkt, (uint8_t)mode);
+    send_uart_packet_wait(pkt, sizeof(pkt));
+    return true;
+}
+
 // Handle text commands from PC
 static void handle_text_command(const char* cmd) {
     // km.move(x,y) - relative mouse movement (route through coalescer for humanization)
@@ -932,14 +1118,21 @@ static void handle_text_command(const char* cmd) {
     if (kmbox_parse_click_command(cmd, &btn)) {
         uint8_t pkt[FAST_CMD_PACKET_SIZE];
         fast_build_mouse_click(pkt, (uint8_t)(1u << btn), 1);
-        send_uart_packet(pkt, sizeof(pkt));
+        send_uart_packet_wait(pkt, sizeof(pkt));
         return;
     }
     
+    // km.press(keycode[,mods]) / km.type(text) - keyboard injection
+    if (handle_key_press_command(cmd) || handle_type_command(cmd) ||
+        handle_key_release_command(cmd) || handle_keys_command(cmd) ||
+        handle_human_command(cmd)) {
+        return;
+    }
+
     // km.version() - report version
     if (kmbox_is_version_command(cmd)) {
         if (tud_cdc_connected()) {
-            tud_cdc_write_str("kmbox bridge v1.0\r\n");
+            tud_cdc_write_str("kmbox bridge v1.2 keys human failsafe\r\n");
             tud_cdc_write_flush();
         }
         return;
@@ -1042,7 +1235,10 @@ static void cdc_task(void) {
     static uint16_t response_idx = 0;
     static uint32_t last_flush_time = 0;
     
-    if (!tud_cdc_connected() || !tud_cdc_available()) {
+    // Keep draining bytes that arrived before the host dropped DTR (e.g. the release-everything
+    // lines Python writes just before closing the port); every response write is already guarded
+    // by tud_cdc_connected().
+    if (!tud_cdc_available()) {
         return;
     }
 
@@ -1062,8 +1258,10 @@ static void cdc_task(void) {
     for (uint32_t i = 0; i < count; i++) {
         uint8_t b = buf[i];
         
-        // Check for Makcu frame start (0x50)
-        if (makcu_state == MAKCU_STATE_IDLE && b == MAKCU_FRAME_START) {
+        // Check for Makcu frame start (0x50) - only at a command boundary, so an uppercase 'P'
+        // inside a km.* text line (km.type("Print")) is not mistaken for a binary frame
+        if (makcu_state == MAKCU_STATE_IDLE && ferrum_idx == 0 && cmd_buffer_idx == 0 &&
+            b == MAKCU_FRAME_START) {
             makcu_state = MAKCU_STATE_HEADER;
             makcu_frame_idx = 0;
             makcu_frame_buffer[makcu_frame_idx++] = b;
@@ -1174,11 +1372,12 @@ static void cdc_task(void) {
                             if (mx != 0 || my != 0) {
                                 coalesce_move(mx, my);
                             } else {
-                                // Button-only or wheel-only: send immediately
-                                send_uart_packet(translated.buffer, translated.length);
+                                // Button-only or wheel-only: send immediately (wait for the UART
+                                // so a burst of button commands is never dropped)
+                                send_uart_packet_wait(translated.buffer, translated.length);
                             }
                         } else {
-                            send_uart_packet(translated.buffer, translated.length);
+                            send_uart_packet_wait(translated.buffer, translated.length);
                         }
                     }
                     // Send Ferrum response (buffered)
@@ -1243,6 +1442,34 @@ static void cdc_task(void) {
         response_idx = 0;
         last_flush_time = now;
     }
+}
+
+// Host-loss failsafe. Board 1 latches the last keyboard / mouse-button state it was given and
+// Windows auto-repeats a held key, so if the controlling program dies (killed, crashed, port
+// closed, cable pulled) mid-keystroke the key would stay "pressed". When the CDC host drops DTR
+// (it always does when the port closes) and every queued byte has been processed, release all
+// keys and mouse buttons and discard any half-received command line.
+static void host_loss_failsafe(void) {
+    static bool was_connected = false;
+    bool connected = tud_cdc_connected();
+    if (was_connected && !connected && !tud_cdc_available()) {
+        uint8_t pkt[FAST_CMD_PACKET_SIZE];
+        for (int i = 0; i < 3; i++) {                       // Board 1 drops a keyboard report while its
+            if (i) sleep_ms(4);                             // HID endpoint is busy, so repeat the release
+            memset(pkt, 0, sizeof(pkt));
+            pkt[0] = FAST_CMD_KEY_COMBO;                    // empty keyboard state
+            send_uart_packet_wait(pkt, sizeof(pkt));
+        }
+        fast_build_mouse_move(pkt, 0, 0, 0, 0);             // all mouse buttons up
+        send_uart_packet_wait(pkt, sizeof(pkt));
+        ferrum_translator_init();                           // forget sticky button state
+        ferrum_idx = 0;
+        ferrum_line[0] = '\0';
+        cmd_buffer_idx = 0;
+        makcu_state = MAKCU_STATE_IDLE;
+        makcu_frame_idx = 0;
+    }
+    was_connected = connected;
 }
 
 // ============================================================================
@@ -1509,6 +1736,7 @@ int main(void) {
     while (1) {
         tud_task();
         cdc_task();
+        host_loss_failsafe();
         uart_rx_task();
         coalesce_flush_task();
         
